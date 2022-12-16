@@ -1,7 +1,7 @@
 mod common;
 use anyhow::Context;
 use common::docker::{pull_images, DockerTestClient, TestContainerService};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use graph_tests::helpers::{
     basename, get_unique_ganache_counter, get_unique_postgres_counter, make_ganache_uri,
     make_ipfs_uri, make_postgres_uri, pretty_output, GraphNodePorts, MappedPorts,
@@ -9,22 +9,12 @@ use graph_tests::helpers::{
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
-const DEFAULT_N_CONCURRENT_TESTS: usize = 15;
-
-lazy_static::lazy_static! {
-    static ref GANACHE_HARD_WAIT_SECONDS: Option<u64> =
-        parse_numeric_environment_variable("TESTS_GANACHE_HARD_WAIT_SECONDS");
-    static ref IPFS_HARD_WAIT_SECONDS: Option<u64> =
-        parse_numeric_environment_variable("TESTS_IPFS_HARD_WAIT_SECONDS");
-    static ref POSTGRES_HARD_WAIT_SECONDS: Option<u64> =
-        parse_numeric_environment_variable("TESTS_POSTGRES_HARD_WAIT_SECONDS");
-}
-
-/// All integration tests subdirectories to run
-pub const INTEGRATION_TESTS_DIRECTORIES: [&str; 8] = [
+/// All directories containing integration tests to run in parallel.
+pub const PARALLEL_TEST_DIRECTORIES: &[&str] = &[
     "api-version-v0-0-4",
     "ganache-reverts",
     "host-exports",
@@ -34,6 +24,37 @@ pub const INTEGRATION_TESTS_DIRECTORIES: [&str; 8] = [
     "remove-then-update",
     "value-roundtrip",
 ];
+
+#[derive(Debug, Clone)]
+struct TestSettings {
+    n_parallel_tests: u64,
+    ganache_hard_wait: Duration,
+    ipfs_hard_wait: Duration,
+    postgres_hard_wait: Duration,
+}
+
+impl TestSettings {
+    /// Automatically fills in missing env. vars. with defaults.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the env. vars. is set incorrectly.
+    pub fn from_env() -> Self {
+        Self {
+            n_parallel_tests: parse_numeric_environment_variable("N_CONCURRENT_TESTS")
+                .unwrap_or(15),
+            ganache_hard_wait: Duration::from_secs(
+                parse_numeric_environment_variable("TESTS_GANACHE_HARD_WAIT_SECONDS").unwrap_or(10),
+            ),
+            ipfs_hard_wait: Duration::from_secs(
+                parse_numeric_environment_variable("TESTS_IPFS_HARD_WAIT_SECONDS").unwrap_or(0),
+            ),
+            postgres_hard_wait: Duration::from_secs(
+                parse_numeric_environment_variable("TESTS_POSTGRES_HARD_WAIT_SECONDS").unwrap_or(0),
+            ),
+        }
+    }
+}
 
 /// Contains all information a test command needs
 #[derive(Debug)]
@@ -72,6 +93,7 @@ struct StdIO {
     stdout: Option<String>,
     stderr: Option<String>,
 }
+
 impl std::fmt::Display for StdIO {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ref stdout) = self.stdout {
@@ -122,106 +144,109 @@ impl IntegrationTestResult {
     }
 }
 
+async fn start_service_container(
+    service: TestContainerService,
+    wait_msg: &str,
+    hard_wait: Duration,
+) -> anyhow::Result<(Arc<DockerTestClient>, Arc<MappedPorts>)> {
+    let docker_client = DockerTestClient::start(service).await.context(format!(
+        "Failed to start container service `{}`",
+        service.name()
+    ))?;
+
+    docker_client
+        .wait_for_message(wait_msg.as_bytes(), hard_wait)
+        .await
+        .context(format!(
+            "failed to wait for {} container to be ready to accept connections",
+            service.name()
+        ))?;
+
+    let ports = docker_client.exposed_ports().await.context(format!(
+        "failed to obtain exposed ports for the `{}` container",
+        service.name()
+    ))?;
+
+    Ok((Arc::new(docker_client), Arc::new(ports)))
+}
+
 /// The main test entrypoint
 #[tokio::test]
 async fn parallel_integration_tests() -> anyhow::Result<()> {
-    // use a environment variable for limiting the number of concurrent tests
-    let n_parallel_tests: usize = std::env::var("N_CONCURRENT_TESTS")
-        .ok()
-        .and_then(|x| x.parse().ok())
-        .unwrap_or(DEFAULT_N_CONCURRENT_TESTS);
+    let test_settings = TestSettings::from_env();
 
     let current_working_directory =
         std::env::current_dir().context("failed to identify working directory")?;
-    let integration_tests_root_directory = current_working_directory.join("integration-tests");
-
-    // pull required docker images
-    pull_images().await;
-
-    let test_directories = INTEGRATION_TESTS_DIRECTORIES
+    let integration_tests_root_directory = current_working_directory.join("parallel-tests");
+    let test_directories = PARALLEL_TEST_DIRECTORIES
         .iter()
-        .map(|ref p| integration_tests_root_directory.join(PathBuf::from(p)))
+        .map(|p| integration_tests_root_directory.join(PathBuf::from(p)))
         .collect::<Vec<PathBuf>>();
 
     // Show discovered tests
-    println!("Found {} integration tests:", test_directories.len());
+    println!("Found {} integration test(s):", test_directories.len());
     for dir in &test_directories {
         println!("  - {}", basename(dir));
     }
 
-    // run `yarn` command to build workspace
-    run_yarn_command(&integration_tests_root_directory).await;
+    tokio::join!(
+        // Pull the required Docker images.
+        pull_images(),
+        // Run `yarn` command to build workspace.
+        run_yarn_command(&integration_tests_root_directory),
+    );
 
     // start docker containers for Postgres and IPFS and wait for them to be ready
-    let postgres = Arc::new(
-        DockerTestClient::start(TestContainerService::Postgres)
-            .await
-            .context("failed to start container service for Postgres.")?,
-    );
-    postgres
-        .wait_for_message(
-            b"database system is ready to accept connections",
-            &*POSTGRES_HARD_WAIT_SECONDS,
-        )
-        .await
-        .context("failed to wait for Postgres container to be ready to accept connections")?;
-
-    let ipfs = DockerTestClient::start(TestContainerService::Ipfs)
-        .await
-        .context("failed to start container service for IPFS.")?;
-    ipfs.wait_for_message(b"Daemon is ready", &*IPFS_HARD_WAIT_SECONDS)
-        .await
-        .context("failed to wait for Ipfs container to be ready to accept connections")?;
-
-    let postgres_ports = Arc::new(
-        postgres
-            .exposed_ports()
-            .await
-            .context("failed to obtain exposed ports for the Postgres container")?,
-    );
-    let ipfs_ports = Arc::new(
-        ipfs.exposed_ports()
-            .await
-            .context("failed to obtain exposed ports for the IPFS container")?,
-    );
+    let (postgres, ipfs) = tokio::try_join!(
+        start_service_container(
+            TestContainerService::Postgres,
+            "database system is ready to accept connections",
+            test_settings.postgres_hard_wait
+        ),
+        start_service_container(
+            TestContainerService::Ipfs,
+            "Daemon is ready",
+            test_settings.ipfs_hard_wait
+        ),
+    )?;
 
     let graph_node = Arc::new(
         fs::canonicalize("../target/debug/graph-node")
             .context("failed to infer `graph-node` program location. (Was it built already?)")?,
     );
 
-    // run tests
-    let mut test_results = Vec::new();
-
-    let mut stream = tokio_stream::iter(test_directories)
+    let stream = tokio_stream::iter(test_directories)
         .map(|dir| {
             run_integration_test(
                 dir,
-                postgres.clone(),
-                postgres_ports.clone(),
-                ipfs_ports.clone(),
+                postgres.0.clone(),
+                postgres.1.clone(),
+                ipfs.1.clone(),
                 graph_node.clone(),
+                test_settings.ganache_hard_wait,
             )
         })
-        .buffered(n_parallel_tests);
+        .buffered(test_settings.n_parallel_tests as usize);
 
-    let mut failed = false;
-    while let Some(test_result) = stream.next().await {
-        let test_result = test_result?;
-        if !test_result.test_command_results.success {
-            failed = true;
-        }
-        test_results.push(test_result);
-    }
+    let test_results: Vec<IntegrationTestResult> = stream.try_collect().await?;
+    let failed = test_results.iter().any(|r| !r.test_command_results.success);
 
-    // Stop containers.
-    postgres
-        .stop()
-        .await
-        .context("failed to stop container service for Postgres")?;
-    ipfs.stop()
-        .await
-        .context("failed to stop container service for IPFS")?;
+    // Stop service containers.
+    tokio::try_join!(
+        async {
+            postgres
+                .0
+                .stop()
+                .await
+                .context("failed to stop container service for Postgres")
+        },
+        async {
+            ipfs.0
+                .stop()
+                .await
+                .context("failed to stop container service for IPFS")
+        },
+    )?;
 
     // print failures
     for failed_test in test_results
@@ -251,6 +276,7 @@ async fn run_integration_test(
     postgres_ports: Arc<MappedPorts>,
     ipfs_ports: Arc<MappedPorts>,
     graph_node_bin: Arc<PathBuf>,
+    ganache_hard_wait: Duration,
 ) -> anyhow::Result<IntegrationTestResult> {
     // start a dedicated ganache container for this test
     let unique_ganache_counter = get_unique_ganache_counter();
@@ -258,7 +284,7 @@ async fn run_integration_test(
         .await
         .context("failed to start container service for Ganache.")?;
     ganache
-        .wait_for_message(b"Listening on ", &*GANACHE_HARD_WAIT_SECONDS)
+        .wait_for_message(b"Listening on ", ganache_hard_wait)
         .await
         .context("failed to wait for Ganache container to be ready to accept connections")?;
 

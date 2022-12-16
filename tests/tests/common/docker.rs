@@ -42,7 +42,7 @@ pub async fn stop_and_remove(client: &Docker, service_name: &str) -> Result<(), 
 }
 
 /// Represents all possible service containers to be spawned
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum TestContainerService {
     Postgres,
     Ipfs,
@@ -63,7 +63,7 @@ impl TestContainerService {
         container::CreateContainerOptions { name: self.name() }
     }
 
-    fn name(&self) -> String {
+    pub fn name(&self) -> String {
         use TestContainerService::*;
         match self {
             Postgres => "graph_node_integration_test_postgres".into(),
@@ -196,7 +196,7 @@ impl DockerTestClient {
     pub async fn wait_for_message(
         &self,
         trigger_message: &[u8],
-        hard_wait: &Option<u64>,
+        hard_wait: Duration,
     ) -> Result<&Self, DockerError> {
         // listen to container logs
         let mut stream = self.client.logs::<String>(
@@ -227,9 +227,7 @@ impl DockerTestClient {
             }
         }
 
-        if let Some(seconds) = hard_wait {
-            sleep(Duration::from_secs(*seconds)).await;
-        }
+        sleep(hard_wait).await;
         Ok(self)
     }
 
