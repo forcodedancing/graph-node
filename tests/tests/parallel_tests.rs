@@ -199,7 +199,10 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
         run_yarn_command(&yarn_workspace_dir),
     );
 
-    // start docker containers for Postgres and IPFS and wait for them to be ready
+    println!("Starting PostgreSQL and IPFS containers...");
+
+    // Not only do we start the containers, but we also need to wait for
+    // them to be up and running and ready to accept connections.
     let (postgres, ipfs) = tokio::try_join!(
         start_service_container(
             TestContainerService::Postgres,
@@ -212,6 +215,8 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
             test_settings.ipfs_hard_wait
         ),
     )?;
+
+    println!("Containers are ready!");
 
     let graph_node = Arc::new(
         fs::canonicalize("../target/debug/graph-node")
@@ -234,7 +239,7 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
     let test_results: Vec<IntegrationTestSummary> = stream.try_collect().await?;
     let failed = test_results.iter().any(|r| !r.test_command_result.success);
 
-    // Stop service containers.
+    // All tests have finished; we don't need the containers anymore.
     tokio::try_join!(
         async {
             postgres
@@ -283,18 +288,12 @@ async fn run_integration_test(
 ) -> anyhow::Result<IntegrationTestSummary> {
     // start a dedicated ganache container for this test
     let unique_ganache_counter = get_unique_ganache_counter();
-    let ganache = DockerTestClient::start(TestContainerService::Ganache(unique_ganache_counter))
-        .await
-        .context("failed to start container service for Ganache.")?;
-    ganache
-        .wait_for_message(b"Listening on ", ganache_hard_wait)
-        .await
-        .context("failed to wait for Ganache container to be ready to accept connections")?;
-
-    let ganache_ports: MappedPorts = ganache
-        .exposed_ports()
-        .await
-        .context("failed to obtain exposed ports for Ganache container")?;
+    let (ganache_client, ganache_ports) = start_service_container(
+        TestContainerService::Ganache(unique_ganache_counter),
+        "Listening on ",
+        ganache_hard_wait,
+    )
+    .await?;
 
     // build URIs
     let postgres_unique_id = get_unique_postgres_counter();
@@ -329,7 +328,7 @@ async fn run_integration_test(
     let graph_node_output = stop_graph_node(&mut graph_node_child_command).await?;
 
     // Stop Ganache.
-    ganache
+    ganache_client
         .stop()
         .await
         .context("failed to stop container service for Ganache")?;
