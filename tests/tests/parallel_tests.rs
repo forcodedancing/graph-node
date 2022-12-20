@@ -13,8 +13,13 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
-/// All directories containing integration tests to run in parallel.
-pub const PARALLEL_TEST_DIRECTORIES: &[&str] = &[
+/// All directories containing integration tests to run.
+///
+/// Hardcoding these paths seems "wrong", and we very well could obtain this
+/// list with some directory listing magic. That would, however, also
+/// require us to filter out `node_modules`, support files, etc.. Hardly worth
+/// it.
+pub const INTEGRATION_TEST_DIRS: &[&str] = &[
     "api-version-v0-0-4",
     "ganache-reverts",
     "host-exports",
@@ -26,14 +31,14 @@ pub const PARALLEL_TEST_DIRECTORIES: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
-struct TestSettings {
+struct IntegrationTestSettings {
     n_parallel_tests: u64,
     ganache_hard_wait: Duration,
     ipfs_hard_wait: Duration,
     postgres_hard_wait: Duration,
 }
 
-impl TestSettings {
+impl IntegrationTestSettings {
     /// Automatically fills in missing env. vars. with defaults.
     ///
     /// # Panics
@@ -56,9 +61,10 @@ impl TestSettings {
     }
 }
 
-/// Contains all information a test command needs
+/// An aggregator of all configuration and settings required to run a single
+/// integration test.
 #[derive(Debug)]
-struct IntegrationTestSetup {
+struct IntegrationTestRecipe {
     postgres_uri: String,
     ipfs_uri: String,
     ganache_port: u16,
@@ -68,33 +74,31 @@ struct IntegrationTestSetup {
     test_directory: PathBuf,
 }
 
-impl IntegrationTestSetup {
+impl IntegrationTestRecipe {
     fn test_name(&self) -> String {
         basename(&self.test_directory)
     }
 
     fn graph_node_admin_uri(&self) -> String {
-        let ws_port = self.graph_node_ports.admin;
-        format!("http://localhost:{}/", ws_port)
+        format!("http://localhost:{}/", self.graph_node_ports.admin)
     }
 }
 
 /// Info about a finished test command
 #[derive(Debug)]
-struct TestCommandResults {
+struct IntegrationTestResult {
     success: bool,
-    _exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
+    _exit_status_code: Option<i32>,
+    output: Output,
 }
 
 #[derive(Debug)]
-struct StdIO {
+struct Output {
     stdout: Option<String>,
     stderr: Option<String>,
 }
 
-impl std::fmt::Display for StdIO {
+impl std::fmt::Display for Output {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ref stdout) = self.stdout {
             write!(f, "{}", stdout)?;
@@ -108,39 +112,38 @@ impl std::fmt::Display for StdIO {
 
 // The results of a finished integration test
 #[derive(Debug)]
-struct IntegrationTestResult {
-    test_setup: IntegrationTestSetup,
-    test_command_results: TestCommandResults,
-    graph_node_stdio: StdIO,
+struct IntegrationTestSummary {
+    test_recipe: IntegrationTestRecipe,
+    test_command_result: IntegrationTestResult,
+    graph_node_output: Output,
 }
 
-impl IntegrationTestResult {
+impl IntegrationTestSummary {
     fn print_outcome(&self) {
-        let status = match self.test_command_results.success {
+        let status = match self.test_command_result.success {
             true => "SUCCESS",
             false => "FAILURE",
         };
-        println!("- Test: {}: {}", status, self.test_setup.test_name())
+        println!("- Test: {}: {}", status, self.test_recipe.test_name())
     }
 
     fn print_failure(&self) {
-        if self.test_command_results.success {
+        if self.test_command_result.success {
             return;
         }
-        let test_name = self.test_setup.test_name();
+        let test_name = self.test_recipe.test_name();
         println!("=============");
         println!("\nFailed test: {}", test_name);
         println!("-------------");
-        println!("{:#?}", self.test_setup);
+        println!("{:#?}", self.test_recipe);
         println!("-------------");
         println!("\nFailed test command output:");
         println!("---------------------------");
-        println!("{}", self.test_command_results.stdout);
-        println!("{}", self.test_command_results.stderr);
+        println!("{}", self.test_command_result.output);
         println!("--------------------------");
         println!("graph-node command output:");
         println!("--------------------------");
-        println!("{}", self.graph_node_stdio);
+        println!("{}", self.graph_node_output);
     }
 }
 
@@ -173,19 +176,19 @@ async fn start_service_container(
 /// The main test entrypoint
 #[tokio::test]
 async fn parallel_integration_tests() -> anyhow::Result<()> {
-    let test_settings = TestSettings::from_env();
+    let test_settings = IntegrationTestSettings::from_env();
 
-    let current_working_directory =
+    let current_working_dir =
         std::env::current_dir().context("failed to identify working directory")?;
-    let integration_tests_root_directory = current_working_directory.join("parallel-tests");
-    let test_directories = PARALLEL_TEST_DIRECTORIES
+    let yarn_workspace_dir = current_working_dir.join("parallel-tests");
+    let test_dirs = INTEGRATION_TEST_DIRS
         .iter()
-        .map(|p| integration_tests_root_directory.join(PathBuf::from(p)))
+        .map(|p| yarn_workspace_dir.join(PathBuf::from(p)))
         .collect::<Vec<PathBuf>>();
 
     // Show discovered tests
-    println!("Found {} integration test(s):", test_directories.len());
-    for dir in &test_directories {
+    println!("Found {} integration test(s):", test_dirs.len());
+    for dir in &test_dirs {
         println!("  - {}", basename(dir));
     }
 
@@ -193,7 +196,7 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
         // Pull the required Docker images.
         pull_images(),
         // Run `yarn` command to build workspace.
-        run_yarn_command(&integration_tests_root_directory),
+        run_yarn_command(&yarn_workspace_dir),
     );
 
     // start docker containers for Postgres and IPFS and wait for them to be ready
@@ -215,7 +218,7 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
             .context("failed to infer `graph-node` program location. (Was it built already?)")?,
     );
 
-    let stream = tokio_stream::iter(test_directories)
+    let stream = tokio_stream::iter(test_dirs)
         .map(|dir| {
             run_integration_test(
                 dir,
@@ -228,8 +231,8 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
         })
         .buffered(test_settings.n_parallel_tests as usize);
 
-    let test_results: Vec<IntegrationTestResult> = stream.try_collect().await?;
-    let failed = test_results.iter().any(|r| !r.test_command_results.success);
+    let test_results: Vec<IntegrationTestSummary> = stream.try_collect().await?;
+    let failed = test_results.iter().any(|r| !r.test_command_result.success);
 
     // Stop service containers.
     tokio::try_join!(
@@ -251,7 +254,7 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
     // print failures
     for failed_test in test_results
         .iter()
-        .filter(|t| !t.test_command_results.success)
+        .filter(|t| !t.test_command_result.success)
     {
         failed_test.print_failure()
     }
@@ -277,7 +280,7 @@ async fn run_integration_test(
     ipfs_ports: Arc<MappedPorts>,
     graph_node_bin: Arc<PathBuf>,
     ganache_hard_wait: Duration,
-) -> anyhow::Result<IntegrationTestResult> {
+) -> anyhow::Result<IntegrationTestSummary> {
     // start a dedicated ganache container for this test
     let unique_ganache_counter = get_unique_ganache_counter();
     let ganache = DockerTestClient::start(TestContainerService::Ganache(unique_ganache_counter))
@@ -305,8 +308,8 @@ async fn run_integration_test(
         .await
         .context("failed to create the test database.")?;
 
-    // prepare to run test comand
-    let test_setup = IntegrationTestSetup {
+    // prepare to run test command
+    let test_recipe = IntegrationTestRecipe {
         postgres_uri,
         ipfs_uri,
         ganache_uri,
@@ -316,97 +319,94 @@ async fn run_integration_test(
         test_directory,
     };
 
-    // spawn graph-node
-    let mut graph_node_child_command = run_graph_node(&test_setup).await?;
+    // Spawn graph-node.
+    let mut graph_node_child_command = run_graph_node(&test_recipe).await?;
 
-    println!("Test started: {}", basename(&test_setup.test_directory));
-    let test_command_results = run_test_command(&test_setup).await?;
+    println!("Test started: {}", basename(&test_recipe.test_directory));
+    let result = run_test_command(&test_recipe).await?;
 
-    // stop graph-node
+    // Stop graph-node and read its output.
+    let graph_node_output = stop_graph_node(&mut graph_node_child_command).await?;
 
-    let graph_node_stdio = stop_graph_node(&mut graph_node_child_command).await?;
-    // stop ganache container
+    // Stop Ganache.
     ganache
         .stop()
         .await
         .context("failed to stop container service for Ganache")?;
 
-    Ok(IntegrationTestResult {
-        test_setup,
-        test_command_results,
-        graph_node_stdio,
+    Ok(IntegrationTestSummary {
+        test_recipe,
+        test_command_result: result,
+        graph_node_output,
     })
 }
 
 /// Runs a command for a integration test
-async fn run_test_command(test_setup: &IntegrationTestSetup) -> anyhow::Result<TestCommandResults> {
+async fn run_test_command(
+    test_recipe: &IntegrationTestRecipe,
+) -> anyhow::Result<IntegrationTestResult> {
     let output = Command::new("yarn")
         .arg("test")
-        .env("GANACHE_TEST_PORT", test_setup.ganache_port.to_string())
-        .env("GRAPH_NODE_ADMIN_URI", test_setup.graph_node_admin_uri())
+        .env("GANACHE_TEST_PORT", test_recipe.ganache_port.to_string())
+        .env("GRAPH_NODE_ADMIN_URI", test_recipe.graph_node_admin_uri())
         .env(
             "GRAPH_NODE_HTTP_PORT",
-            test_setup.graph_node_ports.http.to_string(),
+            test_recipe.graph_node_ports.http.to_string(),
         )
         .env(
             "GRAPH_NODE_INDEX_PORT",
-            test_setup.graph_node_ports.index.to_string(),
+            test_recipe.graph_node_ports.index.to_string(),
         )
-        .env("IPFS_URI", &test_setup.ipfs_uri)
-        .current_dir(&test_setup.test_directory)
+        .env("IPFS_URI", &test_recipe.ipfs_uri)
+        .current_dir(&test_recipe.test_directory)
         .output()
         .await
         .context("failed to run test command")?;
 
-    let test_name = test_setup.test_name();
+    let test_name = test_recipe.test_name();
     let stdout_tag = format!("[{}:stdout] ", test_name);
     let stderr_tag = format!("[{}:stderr] ", test_name);
 
-    Ok(TestCommandResults {
+    Ok(IntegrationTestResult {
+        _exit_status_code: output.status.code(),
         success: output.status.success(),
-        _exit_code: output.status.code(),
-        stdout: pretty_output(&output.stdout, &stdout_tag),
-        stderr: pretty_output(&output.stderr, &stderr_tag),
+        output: Output {
+            stdout: Some(pretty_output(&output.stdout, &stdout_tag)),
+            stderr: Some(pretty_output(&output.stderr, &stderr_tag)),
+        },
     })
 }
-async fn run_graph_node(test_setup: &IntegrationTestSetup) -> anyhow::Result<Child> {
+
+async fn run_graph_node(recipe: &IntegrationTestRecipe) -> anyhow::Result<Child> {
     use std::process::Stdio;
 
-    let mut command = Command::new(test_setup.graph_node_bin.as_os_str());
+    let mut command = Command::new(recipe.graph_node_bin.as_os_str());
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // postgres
         .arg("--postgres-url")
-        .arg(&test_setup.postgres_uri)
-        // ethereum
+        .arg(&recipe.postgres_uri)
         .arg("--ethereum-rpc")
-        .arg(&test_setup.ganache_uri)
-        // ipfs
+        .arg(&recipe.ganache_uri)
         .arg("--ipfs")
-        .arg(&test_setup.ipfs_uri)
-        // http port
+        .arg(&recipe.ipfs_uri)
         .arg("--http-port")
-        .arg(test_setup.graph_node_ports.http.to_string())
-        // index node port
+        .arg(recipe.graph_node_ports.http.to_string())
         .arg("--index-node-port")
-        .arg(test_setup.graph_node_ports.index.to_string())
-        // ws  port
+        .arg(recipe.graph_node_ports.index.to_string())
         .arg("--ws-port")
-        .arg(test_setup.graph_node_ports.ws.to_string())
-        // admin  port
+        .arg(recipe.graph_node_ports.ws.to_string())
         .arg("--admin-port")
-        .arg(test_setup.graph_node_ports.admin.to_string())
-        // metrics  port
+        .arg(recipe.graph_node_ports.admin.to_string())
         .arg("--metrics-port")
-        .arg(test_setup.graph_node_ports.metrics.to_string());
+        .arg(recipe.graph_node_ports.metrics.to_string());
 
     command
         .spawn()
         .context("failed to start graph-node command.")
 }
 
-async fn stop_graph_node(child: &mut Child) -> anyhow::Result<StdIO> {
+async fn stop_graph_node(child: &mut Child) -> anyhow::Result<Output> {
     child.kill().await.context("Failed to kill graph-node")?;
 
     // capture stdio
@@ -419,7 +419,7 @@ async fn stop_graph_node(child: &mut Child) -> anyhow::Result<StdIO> {
         None => None,
     };
 
-    Ok(StdIO { stdout, stderr })
+    Ok(Output { stdout, stderr })
 }
 
 async fn process_stdio<T: AsyncReadExt + Unpin>(
