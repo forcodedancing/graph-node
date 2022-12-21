@@ -1556,7 +1556,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_plain",
- "serde_yaml 0.8.26",
+ "serde_yaml",
  "slog",
  "slog-async",
  "slog-envlogger",
@@ -1718,7 +1718,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "serde_yaml 0.8.26",
+ "serde_yaml",
  "test-store",
  "tower 0.4.12",
  "tower-test",
@@ -1976,8 +1976,7 @@ dependencies = [
  "lazy_static",
  "port_check",
  "serde",
- "serde_yaml 0.8.26",
- "serde_yaml 0.9.16",
+ "serde_yaml",
  "slog",
  "tokio",
  "tokio-stream",
@@ -4019,19 +4018,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92b5b431e8907b50339b51223b97d102db8d987ced36f6e4d03621db9316c834"
-dependencies = [
- "indexmap",
- "itoa 1.0.1",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha-1"
 version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4972,12 +4958,6 @@ checksum = "382810877fe448991dfc7f0dd6e3ae5d58088fd0ea5e35189655f84e6814fa56"
 dependencies = [
  "void",
 ]
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc7ed8ba44ca06be78ea1ad2c3682a43349126c8818054231ee6f4748012aed2"
 
 [[package]]
 name = "unsigned-varint"
