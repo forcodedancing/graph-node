@@ -1,7 +1,7 @@
 use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
 use bollard::{container, Docker};
-use graph_tests::helpers::{contains_subslice, postgres_test_database_name, MappedPorts};
+use graph_tests::helpers::{contains_subslice, MappedPorts};
 use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use tokio_stream::StreamExt;
@@ -234,15 +234,13 @@ impl DockerTestClient {
     /// Calls `docker exec` on the container to create a test database.
     pub async fn create_postgres_database(
         docker: &DockerTestClient,
-        unique_id: &u16,
+        db_name: &str,
     ) -> Result<(), DockerError> {
         use bollard::exec;
 
-        let database_name = postgres_test_database_name(unique_id);
-
         // 1. Create Exec
         let config = exec::CreateExecOptions {
-            cmd: Some(vec!["createdb", "-E", "UTF8", "--locale=C", &database_name]),
+            cmd: Some(vec!["createdb", "-E", "UTF8", "--locale=C", &db_name]),
             user: Some("postgres"),
             attach_stdout: Some(true),
             ..Default::default()
@@ -257,7 +255,7 @@ impl DockerTestClient {
         let mut stream = docker.client.start_exec(&message.id, None);
         while let Some(_) = stream.next().await { /* consume stream */ }
 
-        // 3. Inspecet exec
+        // 3. Inspect exec
         let inspect = docker.client.inspect_exec(&message.id).await?;
         if let Some(0) = inspect.exit_code {
             Ok(())

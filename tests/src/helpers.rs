@@ -9,8 +9,7 @@ use anyhow::Context;
 
 /// A counter for uniquely naming Ganache containers
 static GANACHE_CONTAINER_COUNT: AtomicU16 = AtomicU16::new(0);
-/// A counter for uniquely naming Postgres databases
-static POSTGRES_DATABASE_COUNT: AtomicU16 = AtomicU16::new(0);
+
 /// A counter for uniquely assigning ports.
 static PORT_NUMBER_COUNTER: AtomicU16 = AtomicU16::new(10_000);
 
@@ -35,10 +34,7 @@ pub fn basename(path: &impl AsRef<Path>) -> String {
 pub fn get_unique_ganache_counter() -> u16 {
     increase_atomic_counter(&GANACHE_CONTAINER_COUNT)
 }
-/// Fetches a unique number for naming Postgres databases
-pub fn get_unique_postgres_counter() -> u16 {
-    increase_atomic_counter(&POSTGRES_DATABASE_COUNT)
-}
+
 /// Fetches a unique port number
 pub fn get_unique_port_number() -> u16 {
     increase_atomic_counter(&PORT_NUMBER_COUNTER)
@@ -77,6 +73,7 @@ pub struct GraphNodePorts {
     pub admin: u16,
     pub metrics: u16,
 }
+
 impl GraphNodePorts {
     /// Returns five available port numbers, using dynamic port ranges
     pub fn get_ports() -> GraphNodePorts {
@@ -99,7 +96,7 @@ impl GraphNodePorts {
 }
 
 // Build a postgres connection string
-pub fn make_postgres_uri(unique_id: &u16, postgres_ports: &MappedPorts) -> String {
+pub fn make_postgres_uri(db_name: &str, postgres_ports: &MappedPorts) -> String {
     let port = postgres_ports
         .0
         .get(&POSTGRESQL_DEFAULT_PORT)
@@ -110,7 +107,7 @@ pub fn make_postgres_uri(unique_id: &u16, postgres_ports: &MappedPorts) -> Strin
         password = "password",
         host = "localhost",
         port = port,
-        database_name = postgres_test_database_name(unique_id),
+        database_name = db_name,
     )
 }
 
@@ -134,10 +131,6 @@ pub fn make_ganache_uri(ganache_ports: &MappedPorts) -> (u16, String) {
 
 pub fn contains_subslice<T: PartialEq>(data: &[T], needle: &[T]) -> bool {
     data.windows(needle.len()).any(|w| w == needle)
-}
-
-pub fn postgres_test_database_name(unique_id: &u16) -> String {
-    format!("test_database_{}", unique_id)
 }
 
 /// Returns captured stdout
