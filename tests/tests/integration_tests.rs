@@ -172,7 +172,7 @@ async fn parallel_integration_tests() -> anyhow::Result<()> {
 
     let current_working_dir =
         std::env::current_dir().context("failed to identify working directory")?;
-    let yarn_workspace_dir = current_working_dir.join("parallel-tests");
+    let yarn_workspace_dir = current_working_dir.join("integration-tests");
     let test_dirs = INTEGRATION_TEST_DIRS
         .iter()
         .map(|p| yarn_workspace_dir.join(PathBuf::from(p)))
