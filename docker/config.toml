@@ -1,0 +1,19 @@
+[deployment]
+[[deployment.rule]]
+shard = "primary"
+indexers = [ "default" ]
+
+[store]
+[store.primary]
+connection = "postgresql://graph-node:let-me-in@postgres:5432/graph-node"
+pool_size = 10
+
+[chains]
+ingestor = "block_ingestor_node"
+
+[chains.blog]
+shard = "primary"
+protocol = "cosmos"
+provider = [
+  { label = "blog", details = { type = "firehose", url = "http://host.docker.internal:9030" }},
+]
